@@ -16,13 +16,16 @@
  ******************************************************************************
  */
 
+#include <stdio.h>
 #include <stdint.h>
 
 #include"stm32c031xx.h"
 #include"core_cm0plus.h"
 
+volatile uint32_t ms_counter=0;
 volatile uint16_t epoch=0;
 volatile uint8_t data_cnt=0;
+
 
 
 #if !defined(__SOFT_FP__) && defined(__ARM_FP)
@@ -33,6 +36,12 @@ volatile uint8_t data_cnt=0;
 void service_led_toggle(void);
 void service_pin_toggle(void);
 void send_service_message (char *message);
+
+void SysTick_Handler(void)
+{
+	ms_counter++;
+}
+
 void TIM1_BRK_UP_TRG_COM_IRQHandler(void)
 {
 	service_pin_toggle();
@@ -41,9 +50,11 @@ void TIM1_BRK_UP_TRG_COM_IRQHandler(void)
 
 void TIM3_IRQHandler(void)
 {
-	send_service_message("Ahoj svete\r\n");
+	char zprava[20];
+	sprintf(zprava,"ms_counter: %ld\r\n",(long)ms_counter);
+	send_service_message(zprava);
 	service_led_toggle();
-       TIM3->SR &= ~(TIM_SR_UIF); 				// service LED - to see if TIM3 working (send reports)
+    TIM3->SR &= ~(TIM_SR_UIF); 				// service LED - to see if TIM3 working (send reports)
 }
 
 
@@ -55,7 +66,29 @@ void main_clock_init(void)
 	RCC->CFGR &= ~RCC_CFGR_SW;				    // Reset switch to default
 	RCC->CFGR |= RCC_CFGR_SW_0;                 // Switch system clock to HSE
 	while ((RCC->CFGR & RCC_CFGR_SWS_HSE)==0);  // Wait for switch system clock to HSE
+	SysTick_Config (48000000UL/1000U);			// 48MHz / 1000 -> 48000 ticks to interrupt
+												// SysTick set to 1 ms
+}
 
+void ms_delay(uint32_t dwell)
+{
+	uint32_t from=ms_counter;
+	while ((ms_counter-from)<dwell);
+}
+
+void adc_init(void)
+{
+	uint32_t autocal_value=0;
+	char zprava[50];
+	RCC->APBENR2 |= RCC_APBENR2_ADCEN;			// ADC clock enable
+	ADC1->CR |= ADC_CR_ADVREGEN;
+    ms_delay(5);								// !!! QDS (search for Tadcvreg_stup)
+	ADC1->CR |= ADC_CR_ADCAL;					// Autocalibration
+	while ((ADC1->CR & ADC_CR_ADCAL)!=0);		// Wait for finish autocalibration
+	autocal_value=ADC1->DR;
+	sprintf(zprava,"Autocal: 0x%lx\r\n",autocal_value);
+	send_service_message(zprava);
+	ADC1->CR |= ADC_CR_ADEN;
 }
 
 void adc_trigger_timer_init(void)
@@ -70,6 +103,7 @@ void adc_trigger_timer_init(void)
     NVIC_EnableIRQ(TIM1_BRK_UP_TRG_COM_IRQn);   // Interrupt handler
     TIM1->CR1 |= TIM_CR1_CEN;
 }
+
 
 void stlink_com_timer_init(void)
 {
@@ -131,8 +165,10 @@ int main(void)
    main_clock_init();
    gpio_init();
    service_usart_init();
-   adc_trigger_timer_init();
    stlink_com_timer_init();
+   adc_init();
+   adc_trigger_timer_init();
+
 
 
    while (1);

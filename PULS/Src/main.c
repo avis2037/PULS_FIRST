@@ -22,7 +22,11 @@
 #include"stm32c031xx.h"
 #include"core_cm0plus.h"
 
+#define DMA_BUFFER_SIZE 32
+#define F_CPU 48000000UL
+
 volatile uint32_t ms_counter=0;
+volatile uint16_t adc_buffer[DMA_BUFFER_SIZE]={0x0000};
 volatile uint16_t epoch=0;
 volatile uint8_t data_cnt=0;
 
@@ -50,8 +54,9 @@ void TIM1_BRK_UP_TRG_COM_IRQHandler(void)
 
 void TIM3_IRQHandler(void)
 {
-	char zprava[20];
-	sprintf(zprava,"ms_counter: %ld\r\n",(long)ms_counter);
+	char zprava[100];
+	data_cnt=(uint8_t)DMA1_Channel1->CNDTR;
+	sprintf(zprava,"ADC buffer[%2d]: 0x%04x  Voltage: %4d mv\r\n",data_cnt,adc_buffer[data_cnt],(uint16_t)(adc_buffer[data_cnt]*(3300.0/4096.0)));
 	send_service_message(zprava);
 	service_led_toggle();
     TIM3->SR &= ~(TIM_SR_UIF); 				// service LED - to see if TIM3 working (send reports)
@@ -66,8 +71,8 @@ void main_clock_init(void)
 	RCC->CFGR &= ~RCC_CFGR_SW;				    // Reset switch to default
 	RCC->CFGR |= RCC_CFGR_SW_0;                 // Switch system clock to HSE
 	while ((RCC->CFGR & RCC_CFGR_SWS_HSE)==0);  // Wait for switch system clock to HSE
-	SysTick_Config (48000000UL/1000U);			// 48MHz / 1000 -> 48000 ticks to interrupt
-												// SysTick set to 1 ms
+	SysTick_Config (F_CPU/1000U);		    	// 48MHz / 1000 -> 48000 ticks to interrupt
+									        	// SysTick set to 1 ms
 }
 
 void ms_delay(uint32_t dwell)
@@ -76,19 +81,38 @@ void ms_delay(uint32_t dwell)
 	while ((ms_counter-from)<dwell);
 }
 
+void adc_dma_init(void)
+{
+   RCC->AHBENR |= RCC_AHBENR_DMA1EN;
+
+   DMAMUX1_Channel0->CCR |= (DMAMUX_CxCR_DMAREQ_ID_2|DMAMUX_CxCR_DMAREQ_ID_0); // DMA_MUX to 5 -> ADC1
+   DMA1_Channel1->CCR |=(DMA_CCR_CIRC | DMA_CCR_MINC | DMA_CCR_PSIZE_0 | DMA_CCR_MSIZE_0 | DMA_CCR_PL_1);
+   DMA1_Channel1->CNDTR = DMA_BUFFER_SIZE;
+   DMA1_Channel1->CPAR = (uint32_t)&ADC1->DR;
+   DMA1_Channel1->CMAR = (uint32_t)adc_buffer;
+   DMA1_Channel1->CCR |= DMA_CCR_EN;
+}
+
 void adc_init(void)
 {
-	uint32_t autocal_value=0;
-	char zprava[50];
+	uint32_t autocal=0;
+	uint8_t i=0;
+
 	RCC->APBENR2 |= RCC_APBENR2_ADCEN;			// ADC clock enable
 	ADC1->CR |= ADC_CR_ADVREGEN;
     ms_delay(5);								// !!! QDS (search for Tadcvreg_stup)
-	ADC1->CR |= ADC_CR_ADCAL;					// Autocalibration
-	while ((ADC1->CR & ADC_CR_ADCAL)!=0);		// Wait for finish autocalibration
-	autocal_value=ADC1->DR;
-	sprintf(zprava,"Autocal: 0x%lx\r\n",autocal_value);
-	send_service_message(zprava);
+	for (i=0;i<8;i++)
+	{
+        ADC1->CR |= ADC_CR_ADCAL;											 // Autocalibration
+	    while ((ADC1->CR & ADC_CR_ADCAL)!=0);								 // Wait for finish autocalibration
+	    autocal += ADC1->DR & 0x7F;    										 // Calibration factor filtered (6..0 bit)
+	}
+    ADC1->CALFACT = ((autocal/8U) & 0x7F);									 // Average calibration factor According to RM page 293
+	ADC1->CFGR1 |= (ADC_CFGR1_DMAEN | ADC_CFGR1_DMACFG | ADC_CFGR1_EXTEN_0); // DMA, Circular, External Trigger TRGO2
+    ADC1->CHSELR |= ADC_CHSELR_CHSEL0;
+
 	ADC1->CR |= ADC_CR_ADEN;
+	ADC1->CR |= ADC_CR_ADSTART;
 }
 
 void adc_trigger_timer_init(void)
@@ -96,7 +120,7 @@ void adc_trigger_timer_init(void)
     RCC->APBENR2 |= RCC_APBENR2_TIM1EN;			// TIM1 clock enable
     TIM1->CR1 &= ~(TIM_CR1_CEN);				// Stop TIM1 before re-configuration
     TIM1->CR2 |= TIM_CR2_MMS2_1;				// TRGO2 for ADC enable (Update event -> ADC Trig.)
-    TIM1->PSC = 4799U;							// 48 MHz / 4800 = 10 kHz
+    TIM1->PSC = (F_CPU/10000U)-1U;				// 48 MHz / 4800 = 10 kHz
     TIM1->ARR = 99U;							// 10 kHz / 100 = 100 Hz
     TIM1->CNT = 0U;
     TIM1->DIER |= TIM_DIER_UIE;
@@ -109,8 +133,8 @@ void stlink_com_timer_init(void)
 {
 	RCC->APBENR1 |= RCC_APBENR1_TIM3EN;
 	TIM3->CR1 &= ~(TIM_CR1_CEN);
-	TIM3->PSC=47999U;
-	TIM3->ARR=999U;
+	TIM3->PSC=(F_CPU/10000U)-1U;
+	TIM3->ARR=9999U;
 	TIM3->CNT=0U;
 	TIM3->DIER |= TIM_DIER_UIE;
 	NVIC_EnableIRQ(TIM3_IRQn);
@@ -164,11 +188,11 @@ int main(void)
 {
    main_clock_init();
    gpio_init();
-   service_usart_init();
-   stlink_com_timer_init();
+   adc_dma_init();
    adc_init();
    adc_trigger_timer_init();
-
+   service_usart_init();
+   stlink_com_timer_init();
 
 
    while (1);

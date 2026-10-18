@@ -18,18 +18,21 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 
 #include"stm32c031xx.h"
 #include"core_cm0plus.h"
 
 #define DMA_BUFFER_SIZE 32
+#define SERVICE_TX_BUFFER_SIZE 64
 #define F_CPU 48000000UL
 
 volatile uint32_t ms_counter=0;
-volatile uint16_t adc_buffer[DMA_BUFFER_SIZE]={0x0000};
-volatile uint16_t epoch=0;
+volatile uint16_t adc_buffer[DMA_BUFFER_SIZE];
+volatile uint32_t epoch=0;
 volatile uint8_t data_cnt=0;
-
+volatile char service_tx_buffer[SERVICE_TX_BUFFER_SIZE]={'\0'};
+volatile uint8_t service_tx_index=0;
 
 
 #if !defined(__SOFT_FP__) && defined(__ARM_FP)
@@ -39,7 +42,7 @@ volatile uint8_t data_cnt=0;
 
 void service_led_toggle(void);
 void service_pin_toggle(void);
-void send_service_message (char *message);
+void service_usart_send(char *message);
 
 void SysTick_Handler(void)
 {
@@ -54,12 +57,26 @@ void TIM1_BRK_UP_TRG_COM_IRQHandler(void)
 
 void TIM3_IRQHandler(void)
 {
-	char zprava[100];
-	data_cnt=(uint8_t)DMA1_Channel1->CNDTR;
-	sprintf(zprava,"ADC buffer[%2d]: 0x%04x  Voltage: %4d mv\r\n",data_cnt,adc_buffer[data_cnt],(uint16_t)(adc_buffer[data_cnt]*(3300.0/4096.0)));
-	send_service_message(zprava);
+	char local_buffer[64];
+    sprintf (local_buffer,"EPOCH: %ld\r\n",epoch);
+    service_usart_send(local_buffer);
+    epoch++;
 	service_led_toggle();
     TIM3->SR &= ~(TIM_SR_UIF); 				// service LED - to see if TIM3 working (send reports)
+}
+
+void USART2_IRQHandler(void)
+{
+	if ((USART2->ISR & USART_ISR_TXE_TXFNF)!=0)
+	{
+	if ((service_tx_index<SERVICE_TX_BUFFER_SIZE) && (service_tx_buffer[service_tx_index]!=0))
+	{
+		USART2->TDR=service_tx_buffer[service_tx_index];
+		service_tx_index++;
+	}
+	else
+	USART2->CR1 &= ~(USART_CR1_TXEIE_TXFNFIE);
+	}
 }
 
 
@@ -81,7 +98,7 @@ void ms_delay(uint32_t dwell)
 	while ((ms_counter-from)<dwell);
 }
 
-void adc_dma_init(void)
+void dma_init(void)
 {
    RCC->AHBENR |= RCC_AHBENR_DMA1EN;
 
@@ -160,7 +177,18 @@ void service_usart_init(void)
     RCC->APBENR1 |= RCC_APBENR1_USART2EN;
     USART2->BRR = 48000000UL/921600UL;
     USART2->CR1 |= (USART_CR1_UE|USART_CR1_TE|USART_CR1_RE);
+    NVIC_EnableIRQ(USART2_IRQn);
+}
 
+void service_usart_send (char *message)
+{
+  uint8_t len = strlen (message);
+  if (len>62) len=62;
+  for (service_tx_index=0;service_tx_index<len;service_tx_index++)
+	  service_tx_buffer[service_tx_index]=message[service_tx_index];
+  service_tx_buffer[service_tx_index]='\0';
+  service_tx_index=0;
+  USART2->CR1 |= USART_CR1_TXEIE_TXFNFIE;
 }
 
 void service_led_toggle(void)
@@ -172,23 +200,12 @@ void service_pin_toggle(void)
 	GPIOA->ODR^=GPIO_ODR_OD6;
 }
 
-void send_service_message (char *message)
-{
-   uint8_t i=0;
-   while (message[i]!='\0')
-   {
-     while ((USART2->ISR & USART_ISR_TXE_TXFNF)==0);
-     USART2->TDR=message[i];
-     i++;
-   }
-
-}
 
 int main(void)
 {
    main_clock_init();
    gpio_init();
-   adc_dma_init();
+   dma_init();
    adc_init();
    adc_trigger_timer_init();
    service_usart_init();

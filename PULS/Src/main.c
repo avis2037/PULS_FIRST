@@ -24,16 +24,22 @@
 #include"core_cm0plus.h"
 
 #define DMA_BUFFER_SIZE 32
-#define SERVICE_TX_BUFFER_SIZE 64
+#define SERVICE_TX_BUFFER_SIZE 200
+#define PACKET_TX_BUFFER_SIZE 24
+#define PACKET_RX_BUFFER_SIZE 24
+#define PACKET_TX_SIZE 18
 #define F_CPU 48000000UL
+#define BAUD_SERVICE 921600UL
+#define BAUD_PACKET 460800UL
 
 volatile uint32_t ms_counter=0;
 volatile uint16_t adc_buffer[DMA_BUFFER_SIZE];
+volatile char stx[SERVICE_TX_BUFFER_SIZE]={'\0'};
+volatile uint8_t ptx[PACKET_TX_BUFFER_SIZE];
+volatile uint8_t service_tx_index=0;
+volatile uint8_t packet_tx_index=0;
 volatile uint32_t epoch=0;
 volatile uint8_t data_cnt=0;
-volatile char service_tx_buffer[SERVICE_TX_BUFFER_SIZE]={'\0'};
-volatile uint8_t service_tx_index=0;
-
 
 #if !defined(__SOFT_FP__) && defined(__ARM_FP)
   #warning "FPU is not initialized, but the project is compiling for an FPU. Please initialize the FPU before use."
@@ -43,6 +49,10 @@ volatile uint8_t service_tx_index=0;
 void service_led_toggle(void);
 void service_pin_toggle(void);
 void service_usart_send(char *message);
+void packet_usart_send(void);
+void crc_init(void);
+void crc_compute (uint8_t data);
+uint16_t crc_result(void);
 
 void SysTick_Handler(void)
 {
@@ -57,21 +67,36 @@ void TIM1_BRK_UP_TRG_COM_IRQHandler(void)
 
 void TIM3_IRQHandler(void)
 {
-	char local_buffer[64];
-    sprintf (local_buffer,"EPOCH: %ld\r\n",epoch);
+    char local_buffer[200];
+    packet_usart_send();
+    sprintf (local_buffer,"\r\nEPOCH: %ld\r\nADC: 0x%02X%02X\r\nTX: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",epoch,ptx[1],ptx[0],ptx[0],ptx[1],ptx[2],ptx[3],ptx[4],ptx[5],ptx[6],ptx[7],ptx[8],ptx[9],ptx[10],ptx[11],ptx[12],ptx[13],ptx[14],ptx[15],ptx[16],ptx[17]);
     service_usart_send(local_buffer);
     epoch++;
-	service_led_toggle();
+    service_led_toggle();
     TIM3->SR &= ~(TIM_SR_UIF); 				// service LED - to see if TIM3 working (send reports)
+}
+
+void USART1_IRQHandler(void)
+{       
+	if ((USART1->ISR & USART_ISR_TXE_TXFNF)!=0)
+	{
+	if ((packet_tx_index<PACKET_TX_BUFFER_SIZE) && (packet_tx_index<PACKET_TX_SIZE))
+	{
+		USART1->TDR=ptx[packet_tx_index];
+		packet_tx_index++;
+	}
+	else
+	USART1->CR1 &= ~(USART_CR1_TXEIE_TXFNFIE);
+	}
 }
 
 void USART2_IRQHandler(void)
 {
 	if ((USART2->ISR & USART_ISR_TXE_TXFNF)!=0)
 	{
-	if ((service_tx_index<SERVICE_TX_BUFFER_SIZE) && (service_tx_buffer[service_tx_index]!=0))
+	if ((service_tx_index<SERVICE_TX_BUFFER_SIZE) && (stx[service_tx_index]!=0))
 	{
-		USART2->TDR=service_tx_buffer[service_tx_index];
+		USART2->TDR=stx[service_tx_index];
 		service_tx_index++;
 	}
 	else
@@ -85,17 +110,17 @@ void main_clock_init(void)
 	RCC->CR |= RCC_CR_HSEON_Msk;                // Select external crystal oscillator (48 MHz)
 	while ((RCC->CR & RCC_CR_HSERDY_Msk)==0);   // Wait for external oscillator become ready
 
-	RCC->CFGR &= ~RCC_CFGR_SW;				    // Reset switch to default
+	RCC->CFGR &= ~RCC_CFGR_SW;		    // Reset switch to default
 	RCC->CFGR |= RCC_CFGR_SW_0;                 // Switch system clock to HSE
 	while ((RCC->CFGR & RCC_CFGR_SWS_HSE)==0);  // Wait for switch system clock to HSE
-	SysTick_Config (F_CPU/1000U);		    	// 48MHz / 1000 -> 48000 ticks to interrupt
-									        	// SysTick set to 1 ms
+	SysTick_Config (F_CPU/1000U);	            // 48MHz / 1000 -> 48000 ticks to interrupt
+						    // SysTick set to 1 ms
 }
 
 void ms_delay(uint32_t dwell)
 {
 	uint32_t from=ms_counter;
-	while ((ms_counter-from)<dwell);
+	while ((ms_counter-from)<dwell);            // Delay in miliseconds using SysTick
 }
 
 void dma_init(void)
@@ -112,24 +137,24 @@ void dma_init(void)
 
 void adc_init(void)
 {
-	uint32_t autocal=0;
-	uint8_t i=0;
+    uint32_t autocal=0;
+    uint8_t i=0;
 
-	RCC->APBENR2 |= RCC_APBENR2_ADCEN;			// ADC clock enable
-	ADC1->CR |= ADC_CR_ADVREGEN;
+    RCC->APBENR2 |= RCC_APBENR2_ADCEN;			// ADC clock enable
+    ADC1->CR |= ADC_CR_ADVREGEN;
     ms_delay(5);								// !!! QDS (search for Tadcvreg_stup)
-	for (i=0;i<8;i++)
+        for (i=0;i<8;i++)
 	{
-        ADC1->CR |= ADC_CR_ADCAL;											 // Autocalibration
+            ADC1->CR |= ADC_CR_ADCAL;											 // Autocalibration
 	    while ((ADC1->CR & ADC_CR_ADCAL)!=0);								 // Wait for finish autocalibration
 	    autocal += ADC1->DR & 0x7F;    										 // Calibration factor filtered (6..0 bit)
 	}
-    ADC1->CALFACT = ((autocal/8U) & 0x7F);									 // Average calibration factor According to RM page 293
-	ADC1->CFGR1 |= (ADC_CFGR1_DMAEN | ADC_CFGR1_DMACFG | ADC_CFGR1_EXTEN_0); // DMA, Circular, External Trigger TRGO2
+    ADC1->CALFACT = ((autocal/8U) & 0x7F);									 // Average calibration factor According to RM page 293ADC1->CFGR1 |= (ADC_CFGR1_DMAEN | ADC_CFGR1_DMACFG | ADC_CFGR1_EXTEN_0); // DMA, Circular, External Trigger TRGO2
+    ADC1->CFGR1 |= (ADC_CFGR1_DMAEN | ADC_CFGR1_DMACFG | ADC_CFGR1_EXTEN_0); // DMA, Circular, External Trigger TRGO2    
     ADC1->CHSELR |= ADC_CHSELR_CHSEL0;
 
-	ADC1->CR |= ADC_CR_ADEN;
-	ADC1->CR |= ADC_CR_ADSTART;
+    ADC1->CR |= ADC_CR_ADEN;
+    ADC1->CR |= ADC_CR_ADSTART;
 }
 
 void adc_trigger_timer_init(void)
@@ -146,7 +171,7 @@ void adc_trigger_timer_init(void)
 }
 
 
-void stlink_com_timer_init(void)
+void com_trigger_timer_init(void)
 {
 	RCC->APBENR1 |= RCC_APBENR1_TIM3EN;
 	TIM3->CR1 &= ~(TIM_CR1_CEN);
@@ -170,34 +195,94 @@ void gpio_init(void)
 
 void service_usart_init(void)
 {
-	GPIOA->MODER &= ~(GPIO_MODER_MODE2);			// TX pin mode zeroing
-	GPIOA->MODER |= GPIO_MODER_MODE2_1;				// TX pin set to alternate mode
-	GPIOA->AFR[0] &= ~(0xFU << 8U);					// TX pin alternate function zeroing
-	GPIOA->AFR[0] |= (0x01U << 8U);					// TX pin alternate function set
+    GPIOA->MODER &= ~(GPIO_MODER_MODE2);			
+    GPIOA->MODER |= GPIO_MODER_MODE2_1;	  // PA2 -> Alt		
+    GPIOA->AFR[0] &= ~(0xFU << 8U);				
+    GPIOA->AFR[0] |= (0x01U << 8U);	  // USART2_TX -> PA2
     RCC->APBENR1 |= RCC_APBENR1_USART2EN;
-    USART2->BRR = 48000000UL/921600UL;
+    USART2->BRR = F_CPU/BAUD_SERVICE;
     USART2->CR1 |= (USART_CR1_UE|USART_CR1_TE|USART_CR1_RE);
     NVIC_EnableIRQ(USART2_IRQn);
 }
 
+void packet_usart_init(void)
+{
+  GPIOA->MODER &= ~(GPIO_MODER_MODE9);
+  GPIOA->MODER |= GPIO_MODER_MODE9_1;       // PA9 -> Alt
+  GPIOA->MODER &= ~(GPIO_MODER_MODE10);
+  GPIOA->MODER |= GPIO_MODER_MODE10_1;      // PA10 -> Alt
+  GPIOA->AFR[1] &= ~(0xFU << 4U);        
+  GPIOA->AFR[1] |= (0x01U << 4U);      //  USART1_TX -> PA9
+  GPIOA->AFR[1] &= ~(0xFU << 8U);       
+  GPIOA->AFR[1] |= (0x01U << 8U);     //  USART1_RX <- PA10
+  RCC->APBENR2 |= RCC_APBENR2_USART1EN;
+  USART1->BRR = F_CPU/BAUD_PACKET;
+  USART1->CR1 |= (USART_CR1_UE|USART_CR1_TE|USART_CR1_RE);
+  NVIC_EnableIRQ(USART1_IRQn);
+}
+
 void service_usart_send (char *message)
 {
-  uint8_t len = strlen (message);
-  if (len>62) len=62;
-  for (service_tx_index=0;service_tx_index<len;service_tx_index++)
-	  service_tx_buffer[service_tx_index]=message[service_tx_index];
-  service_tx_buffer[service_tx_index]='\0';
-  service_tx_index=0;
-  USART2->CR1 |= USART_CR1_TXEIE_TXFNFIE;
+    uint8_t len = strlen (message);
+    if (len>SERVICE_TX_BUFFER_SIZE) len=SERVICE_TX_BUFFER_SIZE;
+    for (service_tx_index=0;service_tx_index<len;service_tx_index++)
+        stx[service_tx_index]=message[service_tx_index];
+    stx[service_tx_index]='\0';
+    service_tx_index=0;
+    USART2->CR1 |= USART_CR1_TXEIE_TXFNFIE;
+}
+
+void packet_usart_send (void)
+{
+  uint8_t local_index=0;
+  uint16_t crc_sum=0x0000;
+  crc_init();
+  
+  ptx[0]=adc_buffer[0]%256;
+  crc_compute(ptx[0]);
+  ptx[1]=adc_buffer[0]/256;
+  crc_compute(ptx[1]);
+  
+  for (local_index=2;local_index<16;local_index++)
+  {
+      ptx[local_index]=data_cnt;
+      crc_compute(ptx[local_index]);
+      data_cnt++;
+  }
+  crc_sum = crc_result();
+  ptx[16]=crc_sum%256;
+  ptx[17]=crc_sum/256;
+  packet_tx_index=0;
+  USART1->CR1 |= USART_CR1_TXEIE_TXFNFIE;
 }
 
 void service_led_toggle(void)
 {
-	GPIOA->ODR^=GPIO_ODR_OD5;
+    GPIOA->ODR^=GPIO_ODR_OD5;
 }
 void service_pin_toggle(void)
 {
-	GPIOA->ODR^=GPIO_ODR_OD6;
+    GPIOA->ODR^=GPIO_ODR_OD6;
+}
+
+void crc_init(void)
+{
+    RCC->AHBENR |= RCC_AHBENR_CRCEN;
+    CRC->CR = 0x00000000;
+    CRC->CR |= (CRC_CR_POLYSIZE_0);
+    CRC->POL = 0x1021;
+    CRC->INIT = 0xFFFF;
+    CRC->CR |= (CRC_CR_RESET);
+}
+
+void crc_compute(uint8_t data)
+{
+    *((volatile uint8_t *)&CRC->DR) = data;
+}
+
+uint16_t crc_result (void)
+{
+    return ((uint16_t)(CRC->DR & 0xFFFF));
 }
 
 
@@ -207,10 +292,10 @@ int main(void)
    gpio_init();
    dma_init();
    adc_init();
-   adc_trigger_timer_init();
    service_usart_init();
-   stlink_com_timer_init();
-
-
+   packet_usart_init();
+   adc_trigger_timer_init();
+   com_trigger_timer_init();
+   
    while (1);
 }
